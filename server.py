@@ -3,6 +3,7 @@ import os
 import time
 import base64
 import asyncio
+import re
 from io import BytesIO
 from typing import Optional, Tuple, Dict
 from contextlib import asynccontextmanager
@@ -21,7 +22,6 @@ TOP_ONNX  = os.getenv("TOP_ONNX",  str(MODEL_DIR / "top/model.onnx"))
 TOP_CHRS  = os.getenv("TOP_CHRS",  str(MODEL_DIR / "top/charsets.json"))
 BOT_ONNX  = os.getenv("BOT_ONNX",  str(MODEL_DIR / "bot/model.onnx"))
 BOT_CHRS  = os.getenv("BOT_CHRS",  str(MODEL_DIR / "bot/charsets.json"))
-
 
 DEFAULT_TOP_RATIO = float(os.getenv("TOP_RATIO", "0.5"))         # 上半高度占比
 MAX_CONCURRENCY   = int(os.getenv("MAX_CONCURRENCY", "32"))      # 并发限流
@@ -143,8 +143,16 @@ async def solve(body: SolveBody):
         top_text, bot_text = await asyncio.gather(top_task, bot_task)
 
     top_text = (top_text or "").strip()
+
+    # ✅ 新增：安全加减法解析逻辑（限定 -99~99）
     try:
-        answer = int(top_text)   # 算术模型已直接输出结果数字（可带负号）
+        expr = re.sub(r"[^0-9+\-]", "", top_text)
+        if re.fullmatch(r"-?\d+([+\-]-?\d+)?", expr):
+            answer = eval(expr)
+            if not (-99 <= answer <= 99):
+                answer = None
+        else:
+            answer = None
     except Exception:
         answer = None
 
