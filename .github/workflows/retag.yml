@@ -12,8 +12,10 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Copy manifest (rename)
         run: |
+          set -eux
+          docker buildx imagetools inspect xhzyz/captcha-solver:latest
           docker buildx imagetools create \
             --tag xhzyz/mars-ddddocr:latest \
             xhzyz/captcha-solver:latest
-      - name: Verify
+      - name: Verify new repo
         run: docker buildx imagetools inspect xhzyz/mars-ddddocr:latest
