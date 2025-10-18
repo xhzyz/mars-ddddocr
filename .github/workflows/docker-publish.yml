@@ -28,5 +28,5 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: |
-            xhzyz/captcha-solver:latest
-            xhzyz/captcha-solver:${{ github.sha }}
+            xhzyz/mars-ddddocr:latest
+            xhzyz/mars-ddddocr:${{ github.sha }}
