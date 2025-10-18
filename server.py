@@ -1,12 +1,13 @@
-# server.py  — 双模型并发识别（上半算术 + 下半4位码），高并发优化版
+# server.py — 双模型并发识别（上半算术 + 下半4位码）高并发优化版（CPU多核池）
 import os
 import time
 import base64
 import asyncio
 import re
 from io import BytesIO
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -14,51 +15,47 @@ from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, Field
 from PIL import Image
 import ddddocr
-from pathlib import Path
 
+# ========== 环境配置 ==========
 MODEL_DIR = Path(os.getenv("MODEL_DIR", "/app/models"))
-
 TOP_ONNX  = os.getenv("TOP_ONNX",  str(MODEL_DIR / "top/model.onnx"))
 TOP_CHRS  = os.getenv("TOP_CHRS",  str(MODEL_DIR / "top/charsets.json"))
 BOT_ONNX  = os.getenv("BOT_ONNX",  str(MODEL_DIR / "bot/model.onnx"))
 BOT_CHRS  = os.getenv("BOT_CHRS",  str(MODEL_DIR / "bot/charsets.json"))
 
-DEFAULT_TOP_RATIO = float(os.getenv("TOP_RATIO", "0.5"))         # 上半高度占比
-MAX_CONCURRENCY   = int(os.getenv("MAX_CONCURRENCY", "32"))      # 并发限流
+DEFAULT_TOP_RATIO = float(os.getenv("TOP_RATIO", "0.5"))
 HTTP_TIMEOUT      = float(os.getenv("HTTP_TIMEOUT", "6.0"))
+MAX_CONCURRENCY   = int(os.getenv("MAX_CONCURRENCY", "64"))   # 全局限流
+OCR_POOL_SIZE     = int(os.getenv("OCR_POOL_SIZE", os.cpu_count() or 4))  # 自动按核数
 
-HTTP_LIMITS = httpx.Limits(  # 连接池上限（高并发更稳）
-    max_keepalive_connections=int(os.getenv("MAX_KEEPALIVE", "64")),
-    max_connections=int(os.getenv("MAX_CONNECTIONS", "128")),
+HTTP_LIMITS = httpx.Limits(
+    max_keepalive_connections=64,
+    max_connections=128,
 )
 
-# ========= FastAPI 应用（lifespan 更规范） =========
+# ========== 全局状态 ==========
 state: Dict[str, object] = {
     "client": None,
-    "ocr_top": None,
-    "ocr_bot": None,
+    "ocr_top_pool": [],
+    "ocr_bot_pool": [],
     "sem": asyncio.Semaphore(MAX_CONCURRENCY),
 }
 
+# ========== 启动生命周期 ==========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1) 预加载两个 OCR 模型
-    state["ocr_top"] = ddddocr.DdddOcr(
-        det=False, ocr=False, show_ad=False,
-        import_onnx_path=TOP_ONNX, charsets_path=TOP_CHRS
-    )
-    state["ocr_bot"] = ddddocr.DdddOcr(
-        det=False, ocr=False, show_ad=False,
-        import_onnx_path=BOT_ONNX, charsets_path=BOT_CHRS
-    )
-    # 2) 预热（避免首个请求慢）
-    for ocr in (state["ocr_top"], state["ocr_bot"]):
-        _ = ocr.classification(Image.new("RGB", (6, 6)))  # 传PIL也可，内部会转换
+    print(f"🔥 初始化 OCR 实例池，共 {OCR_POOL_SIZE} 组")
+    for _ in range(OCR_POOL_SIZE):
+        state["ocr_top_pool"].append(ddddocr.DdddOcr(det=False, ocr=False, show_ad=False,
+                                                     import_onnx_path=TOP_ONNX, charsets_path=TOP_CHRS))
+        state["ocr_bot_pool"].append(ddddocr.DdddOcr(det=False, ocr=False, show_ad=False,
+                                                     import_onnx_path=BOT_ONNX, charsets_path=BOT_CHRS))
 
-    # 3) 异步 HTTP 客户端（如果传 URL 会用它抓图）
-    state["client"] = httpx.AsyncClient(
-        http2=True, timeout=HTTP_TIMEOUT, limits=HTTP_LIMITS
-    )
+    # 预热一次，避免首次推理慢
+    for ocr in state["ocr_top_pool"] + state["ocr_bot_pool"]:
+        _ = ocr.classification(Image.new("RGB", (6, 6)))
+
+    state["client"] = httpx.AsyncClient(http2=True, timeout=HTTP_TIMEOUT, limits=HTTP_LIMITS)
     try:
         yield
     finally:
@@ -67,15 +64,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(default_response_class=ORJSONResponse, lifespan=lifespan)
 
-# ========= 工具函数 =========
+# ========== 工具函数 ==========
 def _b64_or_url_to_bytes(s: str) -> Tuple[Optional[str], Optional[bytes]]:
-    """如果是URL返回(url, None)；如果是base64返回(None, bytes)。否则抛错。"""
     s = (s or "").strip()
     if s.startswith(("http://", "https://")):
         return s, None
     if "base64," in s:
         s = s.split("base64,")[-1]
-    pad = "=" * (-len(s) % 4)  # 补齐padding
+    pad = "=" * (-len(s) % 4)
     try:
         return None, base64.b64decode(s + pad)
     except Exception as e:
@@ -97,24 +93,27 @@ def _split_top_bottom(img: Image.Image, top_ratio: float):
     meta = {"w": w, "h": h, "cut": cut, "top_box": [0, 0, w, cut], "bottom_box": [0, cut, w, h]}
     return top, bot, meta
 
-async def _ocr_bytes(ocr: ddddocr.DdddOcr, data: bytes) -> str:
-    # ddddocr.classification 是同步的；用线程池避免阻塞事件循环（高并发更稳）
-    return await asyncio.to_thread(ocr.classification, data)
-
 def _to_png_bytes(img: Image.Image) -> bytes:
     buf = BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-# ========= 请求/响应模型 =========
+# ========== OCR 线程池封装 ==========
+async def _ocr_bytes(is_top: bool, data: bytes) -> str:
+    async with state["sem"]:
+        pool = state["ocr_top_pool"] if is_top else state["ocr_bot_pool"]
+        ocr = pool[hash(asyncio.current_task()) % len(pool)]
+        return await asyncio.to_thread(ocr.classification, data)
+
+# ========== 数据模型 ==========
 class SolveBody(BaseModel):
-    image: str = Field(..., description="完整验证码（base64 或 URL）")
-    top_ratio: float = Field(DEFAULT_TOP_RATIO, ge=0.2, le=0.8, description="上半高度占比")
+    image: str
+    top_ratio: float = Field(DEFAULT_TOP_RATIO, ge=0.2, le=0.8)
 
 class Health(BaseModel):
     ok: bool
 
-# ========= 路由 =========
+# ========== 路由 ==========
 @app.get("/healthz", response_model=Health)
 async def healthz():
     return {"ok": True}
@@ -125,26 +124,20 @@ async def solve(body: SolveBody):
     url, raw = _b64_or_url_to_bytes(body.image)
     img_bytes = await _fetch_if_url(url, raw)
 
-    # 解码 + 拆图
     try:
         full = Image.open(BytesIO(img_bytes)).convert("RGB")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Cannot decode image: {e}")
+
     top_img, bot_img, meta = _split_top_bottom(full, body.top_ratio)
+    tb, bb = _to_png_bytes(top_img), _to_png_bytes(bot_img)
 
-    # 转 Bytes（PNG）
-    tb = _to_png_bytes(top_img)
-    bb = _to_png_bytes(bot_img)
-
-    # 并发识别
-    async with state["sem"]:
-        top_task = asyncio.create_task(_ocr_bytes(state["ocr_top"], tb))
-        bot_task = asyncio.create_task(_ocr_bytes(state["ocr_bot"], bb))
-        top_text, bot_text = await asyncio.gather(top_task, bot_task)
+    # ⚡ 真正并发 OCR
+    top_task = asyncio.create_task(_ocr_bytes(True, tb))
+    bot_task = asyncio.create_task(_ocr_bytes(False, bb))
+    top_text, bot_text = await asyncio.gather(top_task, bot_task)
 
     top_text = (top_text or "").strip()
-
-    # ✅ 新增：安全加减法解析逻辑（限定 -99~99）
     try:
         expr = re.sub(r"[^0-9+\-]", "", top_text)
         if re.fullmatch(r"-?\d+([+\-]-?\d+)?", expr):
@@ -164,4 +157,5 @@ async def solve(body: SolveBody):
         "timings_sec": {"total": round(time.perf_counter() - t0, 4)},
     }
 
-# 运行： uvicorn server:app --host 0.0.0.0 --port 7777  （生产建议多worker，如：--workers 2）
+# 启动命令（推荐4-8核服务器）：
+#   uvicorn server:app --host 0.0.0.0 --port 7777 --workers 2
