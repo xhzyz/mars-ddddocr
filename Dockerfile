@@ -23,7 +23,7 @@ COPY server.py /app/server.py
 COPY models/top/calc_top_0.99609375_266_4000_2025-10-18-20-31-19.onnx /app/models/top/model.onnx
 COPY models/top/charsets.json                                         /app/models/top/charsets.json
 # 底部
-COPY models/bot/myproj_1.0_321_28000_2025-10-18-07-08-32.onnx         /app/models/bot/model.onnx
+COPY models/bot/bot90.onnx         /app/models/bot/model.onnx
 COPY models/bot/charsets.json                                         /app/models/bot/charsets.json
 
 EXPOSE 7777
